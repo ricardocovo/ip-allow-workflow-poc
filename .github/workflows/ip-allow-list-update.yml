@@ -1,0 +1,110 @@
+name: IP Allow List Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */4 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ip-allow-list-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download latest Service Tags
+        id: download
+        run: >-
+          python scripts/ip_allow_list.py download
+          --download-dir "${{ runner.temp }}/service-tags"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload Service Tags artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: azure-service-tags-${{ steps.download.outputs.source_date }}
+          path: ${{ steps.download.outputs.download_path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Use snapshot from an open automation PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTOMATION_BRANCH: automation/ip-allow-list-update
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp data/powerbi-canadacentral-prefixes.json \
+            "${RUNNER_TEMP}/main-powerbi-canadacentral-prefixes.json"
+          open_prs="$(gh pr list --head "$AUTOMATION_BRANCH" --state open --json number --jq 'length')"
+          if [[ "$open_prs" -gt 1 ]]; then
+            echo "Expected at most one open automation PR; found $open_prs" >&2
+            exit 1
+          fi
+          if [[ "$open_prs" -eq 1 ]]; then
+            git fetch --no-tags origin "$AUTOMATION_BRANCH"
+            git show FETCH_HEAD:data/powerbi-canadacentral-prefixes.json > snapshot.tmp
+            mv snapshot.tmp data/powerbi-canadacentral-prefixes.json
+          fi
+
+      - name: Build IP allow-list actions
+        id: process
+        run: >-
+          python scripts/ip_allow_list.py process
+          --source "${{ steps.download.outputs.download_path }}"
+          --snapshot data/powerbi-canadacentral-prefixes.json
+          --action-baseline "${{ runner.temp }}/main-powerbi-canadacentral-prefixes.json"
+          --actions ip-manage-actions.json
+          --summary "${{ runner.temp }}/ip-change-summary.md"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        if: steps.process.outputs.changed == 'true'
+        id: pull-request
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          token: ${{ secrets.IP_ALLOW_LIST_PR_TOKEN || github.token }}
+          branch: automation/ip-allow-list-update
+          delete-branch: true
+          commit-message: Update Power BI Canada Central IP allow list
+          title: Update Power BI Canada Central IP allow list
+          body: |
+            Automated update from the latest Azure Public Service Tags publication.
+
+            The detailed CIDR additions and removals are included in a PR comment.
+          add-paths: |
+            data/powerbi-canadacentral-prefixes.json
+            ip-manage-actions.json
+
+      - name: Comment with IP address changes
+        if: >-
+          steps.process.outputs.changed == 'true' &&
+          steps.pull-request.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
+          SUMMARY_PATH: ${{ steps.process.outputs.summary_path }}
+        run: gh pr comment "$PR_NUMBER" --body-file "$SUMMARY_PATH"
+
+      - name: Create SNOW Entry
+        if: >-
+          steps.process.outputs.changed == 'true' &&
+          steps.pull-request.outputs.pull-request-number != ''
+        run: >-
+          python scripts/ip_allow_list.py create-snow-entry
+          --actions ip-manage-actions.json

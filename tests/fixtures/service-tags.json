@@ -1,0 +1,35 @@
+{
+  "changeNumber": 1,
+  "cloud": "Public",
+  "values": [
+    {
+      "name": "PowerBI",
+      "properties": {
+        "addressPrefixes": [
+          "10.0.0.0/24"
+        ]
+      }
+    },
+    {
+      "name": "PowerBI.CanadaCentral",
+      "properties": {
+        "region": "canadacentral",
+        "systemService": "PowerBI",
+        "addressPrefixes": [
+          "2603:1030:f05::/122",
+          "20.48.202.16/29",
+          "4.206.229.128/27",
+          "20.48.202.16/29"
+        ]
+      }
+    },
+    {
+      "name": "PowerBI.CanadaEast",
+      "properties": {
+        "addressPrefixes": [
+          "10.1.0.0/24"
+        ]
+      }
+    }
+  ]
+}
