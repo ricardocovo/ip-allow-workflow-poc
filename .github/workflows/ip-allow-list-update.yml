@@ -14,13 +14,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  update:
+  download:
     runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ steps.artifact.outputs.name }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,13 +34,54 @@ jobs:
           --download-dir "${{ runner.temp }}/service-tags"
           --github-output "$GITHUB_OUTPUT"
 
+      - name: Set artifact name
+        id: artifact
+        env:
+          SOURCE_DATE: ${{ steps.download.outputs.source_date }}
+        run: echo "name=azure-service-tags-${SOURCE_DATE}" >> "$GITHUB_OUTPUT"
+
       - name: Upload Service Tags artifact
         uses: actions/upload-artifact@v4
         with:
-          name: azure-service-tags-${{ steps.download.outputs.source_date }}
+          name: ${{ steps.artifact.outputs.name }}
           path: ${{ steps.download.outputs.download_path }}
           if-no-files-found: error
           retention-days: 30
+
+  process:
+    needs: download
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.process.outputs.changed }}
+      pull-request-number: ${{ steps.pull-request.outputs.pull-request-number }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download Service Tags artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.download.outputs.artifact-name }}
+          path: ${{ runner.temp }}/service-tags
+
+      - name: Locate Service Tags file
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t source_files < <(find "${RUNNER_TEMP}/service-tags" -type f)
+          if [[ "${#source_files[@]}" -ne 1 ]]; then
+            echo "Expected exactly one Service Tags file; found ${#source_files[@]}" >&2
+            exit 1
+          fi
+          echo "path=${source_files[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Use snapshot from an open automation PR
         env:
@@ -66,7 +107,7 @@ jobs:
         id: process
         run: >-
           python scripts/ip_allow_list.py process
-          --source "${{ steps.download.outputs.download_path }}"
+          --source "${{ steps.source.outputs.path }}"
           --snapshot data/powerbi-canadacentral-prefixes.json
           --action-baseline "${{ runner.temp }}/main-powerbi-canadacentral-prefixes.json"
           --actions ip-manage-actions.json
@@ -101,10 +142,39 @@ jobs:
           SUMMARY_PATH: ${{ steps.process.outputs.summary_path }}
         run: gh pr comment "$PR_NUMBER" --body-file "$SUMMARY_PATH"
 
-      - name: Create SNOW Entry
+      - name: Upload IP management actions
         if: >-
           steps.process.outputs.changed == 'true' &&
           steps.pull-request.outputs.pull-request-number != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ip-manage-actions
+          path: ip-manage-actions.json
+          if-no-files-found: error
+          retention-days: 30
+
+  call-api:
+    needs: process
+    if: >-
+      needs.process.outputs.changed == 'true' &&
+      needs.process.outputs.pull-request-number != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download IP management actions
+        uses: actions/download-artifact@v4
+        with:
+          name: ip-manage-actions
+          path: ${{ runner.temp }}/ip-manage-actions
+
+      - name: Create SNOW Entry
         run: >-
           python scripts/ip_allow_list.py create-snow-entry
-          --actions ip-manage-actions.json
+          --actions "${{ runner.temp }}/ip-manage-actions/ip-manage-actions.json"
