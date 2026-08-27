@@ -25,6 +25,22 @@ can also be started manually through `workflow_dispatch`. In each run it:
 7. Posts a PR comment summarizing added and removed CIDRs.
 8. Calls the mocked SNOW integration step with the action payload.
 
+```mermaid
+flowchart TD
+    A[Scheduled or manual trigger] --> B[Download latest Azure Service Tags]
+    B --> C[Upload source JSON as an artifact]
+    C --> D{Open automation PR?}
+    D -- Yes --> E[Use the PR snapshot as the processing baseline]
+    D -- No --> F[Use the default branch snapshot]
+    E --> G[Extract and normalize Power BI Canada Central CIDRs]
+    F --> G
+    G --> H{CIDR set changed?}
+    H -- No --> I[Finish without a PR or SNOW entry]
+    H -- Yes --> J[Create or update the automation PR]
+    J --> K[Comment with added and removed CIDRs]
+    K --> L[Call the mocked SNOW integration]
+```
+
 The automation is designed to handle open PRs safely: if a proposal is already in
 progress, the workflow uses that branch's snapshot as the comparison baseline to
 avoid repeating the same change before it is merged. The `add`/`remove` entries
