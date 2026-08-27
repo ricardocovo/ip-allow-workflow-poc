@@ -14,8 +14,12 @@ permissions:
   contents: write
   pull-requests: write
 
+env:
+  AUTOMATION_BRANCH: automation/ip-allow-list-update-${{ github.ref_name }}
+  TARGET_BRANCH: ${{ github.ref_name }}
+
 concurrency:
-  group: ip-allow-list-update
+  group: ip-allow-list-update-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -126,13 +130,19 @@ jobs:
       - name: Use snapshot from an open automation PR
         env:
           GH_TOKEN: ${{ github.token }}
-          AUTOMATION_BRANCH: automation/ip-allow-list-update
         shell: bash
         run: |
           set -euo pipefail
           cp data/powerbi-canadacentral-prefixes.json \
             "${RUNNER_TEMP}/main-powerbi-canadacentral-prefixes.json"
-          open_prs="$(gh pr list --head "$AUTOMATION_BRANCH" --state open --json number --jq 'length')"
+          open_prs="$(
+            gh pr list \
+              --head "$AUTOMATION_BRANCH" \
+              --base "$TARGET_BRANCH" \
+              --state open \
+              --json number \
+              --jq 'length'
+          )"
           if [[ "$open_prs" -gt 1 ]]; then
             echo "Expected at most one open automation PR; found $open_prs" >&2
             exit 1
@@ -160,7 +170,8 @@ jobs:
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.IP_ALLOW_LIST_PR_TOKEN || github.token }}
-          branch: automation/ip-allow-list-update
+          branch: ${{ env.AUTOMATION_BRANCH }}
+          base: ${{ env.TARGET_BRANCH }}
           delete-branch: true
           commit-message: Update Power BI Canada Central IP allow list
           title: Update Power BI Canada Central IP allow list

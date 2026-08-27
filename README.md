@@ -50,13 +50,14 @@ flowchart TD
     M --> N[Call the mocked SNOW integration]
 ```
 
-The automation is designed to handle open PRs safely: if a proposal is already in
-progress, the workflow uses that branch's snapshot as the comparison baseline to
-avoid repeating the same change before it is merged. The `add`/`remove` entries
-still compare against the default branch state, so the PR always shows the full
-net change relative to the merged result. If a later service-tag publication
-reverts an unmerged change, no PR or SNOW entry is created because the effective
-change is empty.
+The automation is designed to handle open PRs safely. Each target branch uses an
+automation branch named `automation/ip-allow-list-update-<target-branch>`. If a
+proposal is already in progress, the workflow uses that automation branch's
+snapshot as the comparison baseline to avoid repeating the same change before it
+is merged. The `add`/`remove` entries still compare against the target branch
+state, so the PR always shows the full net change relative to the merged result.
+If a later service-tag publication reverts an unmerged change, no PR or SNOW
+entry is created because the effective change is empty.
 
 The repository must allow GitHub Actions to create pull requests. If that
 setting cannot be enabled, configure an `IP_ALLOW_LIST_PR_TOKEN` Actions secret
