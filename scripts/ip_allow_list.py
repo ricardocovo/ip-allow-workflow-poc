@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
-"""Discover, download, and process Azure Service Tags for Power BI."""
+"""Download and process Azure Service Tags for Power BI."""
 
 from __future__ import annotations
 
 import argparse
-import html
 import ipaddress
 import json
 import re
 import sys
 import tempfile
-from datetime import datetime, timezone
-from html.parser import HTMLParser
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
-from urllib.parse import urljoin
+from urllib.error import HTTPError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
-DOWNLOAD_PAGE_URL = "https://www.microsoft.com/en-us/download/details.aspx?id=56519"
 SERVICE_TAG_NAME = "PowerBI.CanadaCentral"
 DOWNLOAD_PATTERN = re.compile(
     r"ServiceTags_Public_(?P<date>\d{8})\.json", re.IGNORECASE
-)
-URL_PATTERN = re.compile(
-    r"https?://[^\"'<>\s]+ServiceTags_Public_\d{8}\.json", re.IGNORECASE
 )
 
 
@@ -32,17 +27,8 @@ class ServiceTagsError(RuntimeError):
     """Raised when Service Tags data cannot be safely processed."""
 
 
-class _LinkParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.links: list[str] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        for name, value in attrs:
-            if name.lower() in {"href", "src"} and value:
-                self.links.append(value)
+class ServiceTagsNotFound(ServiceTagsError):
+    """Raised when Microsoft has not published the requested dated file."""
 
 
 def _request_bytes(url: str, timeout: int = 30) -> bytes:
@@ -50,63 +36,44 @@ def _request_bytes(url: str, timeout: int = 30) -> bytes:
     try:
         with urlopen(request, timeout=timeout) as response:
             return response.read()
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise ServiceTagsNotFound(
+                f"Service Tags publication was not found: {url}"
+            ) from exc
+        raise ServiceTagsError(
+            f"Unable to retrieve {url}: HTTP {exc.code} {exc.reason}"
+        ) from exc
     except OSError as exc:
         raise ServiceTagsError(f"Unable to retrieve {url}: {exc}") from exc
 
 
-def find_download_urls(page: str, page_url: str = DOWNLOAD_PAGE_URL) -> list[str]:
-    """Return dated Service Tags JSON links embedded in a download page."""
-    normalized = html.unescape(page).replace("\\/", "/").replace("\\u002F", "/")
-    normalized = normalized.replace("\\u002f", "/")
-    parser = _LinkParser()
-    parser.feed(normalized)
+def download_service_tags(download_dir: Path, download_url: str) -> Path:
+    parsed_url = urlparse(download_url)
+    if (
+        parsed_url.scheme != "https"
+        or not parsed_url.netloc
+        or any(character.isspace() for character in download_url)
+    ):
+        raise ServiceTagsError(
+            f"Download URL must be a valid HTTPS URL: {download_url}"
+        )
 
-    candidates = [urljoin(page_url, link) for link in parser.links]
-    candidates.extend(match.group(0) for match in URL_PATTERN.finditer(normalized))
-    return sorted(
-        {
-            candidate.rstrip("\\")
-            for candidate in candidates
-            if DOWNLOAD_PATTERN.search(candidate)
-        }
-    )
-
-
-def select_latest_download_url(candidates: Sequence[str]) -> str:
-    if not candidates:
-        raise ServiceTagsError("No ServiceTags_Public_YYYYMMDD.json link found")
-
-    def source_date(candidate: str) -> str:
-        match = DOWNLOAD_PATTERN.search(candidate)
-        if match is None:
-            raise ServiceTagsError(f"Unexpected Service Tags URL: {candidate}")
-        return match.group("date")
-
-    return max(candidates, key=source_date)
-
-
-def discover_latest_download_url(page_url: str = DOWNLOAD_PAGE_URL) -> str:
-    page = _request_bytes(page_url).decode("utf-8", errors="strict")
-    candidates = find_download_urls(page, page_url)
-    try:
-        return select_latest_download_url(candidates)
-    except ServiceTagsError as exc:
-        raise ServiceTagsError(f"{exc} at {page_url}") from exc
-
-
-def download_service_tags(download_dir: Path, page_url: str) -> Path:
-    url = discover_latest_download_url(page_url)
-    match = DOWNLOAD_PATTERN.search(url)
+    filename = Path(parsed_url.path).name
+    match = DOWNLOAD_PATTERN.fullmatch(filename)
     if match is None:
-        raise ServiceTagsError(f"Discovered URL has an unexpected filename: {url}")
+        raise ServiceTagsError(
+            f"Download URL has an unexpected filename: {download_url}"
+        )
 
     destination = download_dir / match.group(0)
-    download_dir.mkdir(parents=True, exist_ok=True)
-    payload = _request_bytes(url)
+    payload = _request_bytes(download_url)
     try:
         json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ServiceTagsError(f"Downloaded file is not valid JSON: {url}") from exc
+        raise ServiceTagsError(
+            f"Downloaded file is not valid JSON: {download_url}"
+        ) from exc
     _write_bytes(destination, payload)
     return destination
 
@@ -195,18 +162,21 @@ def build_actions(added: Sequence[str], removed: Sequence[str], date: str) -> di
     }
 
 
-def build_snapshot(prefixes: Sequence[str], source_filename: str) -> dict[str, Any]:
+def source_date(source_filename: str) -> str:
     match = DOWNLOAD_PATTERN.fullmatch(source_filename)
     if match is None:
         raise ServiceTagsError(
             f"Source filename does not match ServiceTags_Public_YYYYMMDD.json: "
             f"{source_filename}"
         )
-    source_date = datetime.strptime(match.group("date"), "%Y%m%d").date().isoformat()
+    return datetime.strptime(match.group("date"), "%Y%m%d").date().isoformat()
+
+
+def build_snapshot(prefixes: Sequence[str], source_filename: str) -> dict[str, Any]:
     return {
         "serviceTag": SERVICE_TAG_NAME,
         "sourceFile": source_filename,
-        "sourceDate": source_date,
+        "sourceDate": source_date(source_filename),
         "prefixes": list(prefixes),
     }
 
@@ -267,7 +237,6 @@ def process_file(
     snapshot_path: Path,
     actions_path: Path,
     summary_path: Path,
-    updated_date: str | None = None,
     action_baseline_path: Path | None = None,
 ) -> dict[str, str]:
     current = extract_prefixes(load_json(source))
@@ -287,8 +256,7 @@ def process_file(
 
     write_text(summary_path, build_summary(added, removed))
     if changed:
-        date = updated_date or datetime.now(timezone.utc).date().isoformat()
-        write_json(actions_path, build_actions(added, removed, date))
+        write_json(actions_path, build_actions(added, removed, source_date(source.name)))
         write_json(snapshot_path, build_snapshot(current, source.name))
 
     return {
@@ -326,9 +294,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    download = subparsers.add_parser("download", help="Download the latest Service Tags")
+    download = subparsers.add_parser("download", help="Download a Service Tags file")
+    download.add_argument("--download-url", required=True)
     download.add_argument("--download-dir", type=Path, required=True)
-    download.add_argument("--download-page", default=DOWNLOAD_PAGE_URL)
     download.add_argument("--github-output")
 
     process = subparsers.add_parser("process", help="Build the IP allow-list delta")
@@ -336,7 +304,6 @@ def _build_parser() -> argparse.ArgumentParser:
     process.add_argument("--snapshot", type=Path, required=True)
     process.add_argument("--actions", type=Path, required=True)
     process.add_argument("--summary", type=Path, required=True)
-    process.add_argument("--updated-date")
     process.add_argument("--action-baseline", type=Path)
     process.add_argument("--github-output")
 
@@ -349,7 +316,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         if args.command == "download":
-            downloaded = download_service_tags(args.download_dir, args.download_page)
+            try:
+                downloaded = download_service_tags(
+                    args.download_dir, args.download_url
+                )
+            except ServiceTagsNotFound as exc:
+                write_github_outputs(
+                    _github_output_argument(args.github_output),
+                    {"available": "false"},
+                )
+                print(f"notice: {exc}", file=sys.stderr)
+                return 0
             date_match = DOWNLOAD_PATTERN.fullmatch(downloaded.name)
             if date_match is None:
                 raise ServiceTagsError(
@@ -358,6 +335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_github_outputs(
                 _github_output_argument(args.github_output),
                 {
+                    "available": "true",
                     "download_path": str(downloaded),
                     "source_filename": downloaded.name,
                     "source_date": date_match.group("date"),
@@ -370,7 +348,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.snapshot,
                 args.actions,
                 args.summary,
-                args.updated_date,
                 args.action_baseline,
             )
             write_github_outputs(_github_output_argument(args.github_output), outputs)

@@ -12,8 +12,8 @@ Central allow list in sync with Microsoft's Azure Public Service Tags feed.
 It runs on a schedule (`cron: "17 */4 * * *"`, which is every four hours) and
 can also be started manually through `workflow_dispatch`. In each run it:
 
-1. Fetches the newest Azure Service Tags download page and discovers the newest
-   `ServiceTags_Public_YYYYMMDD.json` file.
+1. Builds the Azure Service Tags URL using today's UTC date, or an optional
+   `YYYYMMDD` date supplied for a manual run.
 2. Downloads the source JSON and stores it as a build artifact for 30 days.
 3. Extracts the `PowerBI.CanadaCentral` `addressPrefixes` values and normalizes
    them into a deterministic list of CIDRs.
@@ -25,20 +25,29 @@ can also be started manually through `workflow_dispatch`. In each run it:
 7. Posts a PR comment summarizing added and removed CIDRs.
 8. Calls the mocked SNOW integration step with the action payload.
 
+Microsoft does not publish a Service Tags file every day. If the constructed URL
+returns HTTP 404, the workflow finishes successfully without uploading an
+artifact or running the processing and API jobs. Other download failures still
+fail the workflow. A manually triggered run can use the optional `date` input to
+target a specific publication; omitted inputs and scheduled runs use today's UTC
+date.
+
 ```mermaid
 flowchart TD
-    A[Scheduled or manual trigger] --> B[Download latest Azure Service Tags]
-    B --> C[Upload source JSON as an artifact]
-    C --> D{Open automation PR?}
-    D -- Yes --> E[Use the PR snapshot as the processing baseline]
-    D -- No --> F[Use the default branch snapshot]
-    E --> G[Extract and normalize Power BI Canada Central CIDRs]
-    F --> G
-    G --> H{CIDR set changed?}
-    H -- No --> I[Finish without a PR or SNOW entry]
-    H -- Yes --> J[Create or update the automation PR]
-    J --> K[Comment with added and removed CIDRs]
-    K --> L[Call the mocked SNOW integration]
+    A[Scheduled or manual trigger] --> B[Resolve publication date and URL]
+    B --> C{Publication available?}
+    C -- No, HTTP 404 --> D[Finish successfully]
+    C -- Yes --> E[Upload source JSON as an artifact]
+    E --> F{Open automation PR?}
+    F -- Yes --> G[Use the PR snapshot as the processing baseline]
+    F -- No --> H[Use the default branch snapshot]
+    G --> I[Extract and normalize Power BI Canada Central CIDRs]
+    H --> I
+    I --> J{CIDR set changed?}
+    J -- No --> K[Finish without a PR or SNOW entry]
+    J -- Yes --> L[Create or update the automation PR]
+    L --> M[Comment with added and removed CIDRs]
+    M --> N[Call the mocked SNOW integration]
 ```
 
 The automation is designed to handle open PRs safely: if a proposal is already in
@@ -61,9 +70,9 @@ flow, with a few files providing the data and the execution logic.
 
 - `.github/workflows/ip-allow-list-update.yml` - defines the scheduled/manual
   GitHub Actions pipeline and the approval/PR flow.
-- `scripts/ip_allow_list.py` - Python entry point that discovers the Azure
-  download URL, downloads the JSON, normalizes CIDRs, compares snapshots, writes
-  the delta action file, and mocks the SNOW API call.
+- `scripts/ip_allow_list.py` - Python entry point that downloads an Azure
+  Service Tags URL, normalizes CIDRs, compares snapshots, writes the delta
+  action file, and mocks the SNOW API call.
 - `data/powerbi-canadacentral-prefixes.json` - the checked-in snapshot of the
   currently approved `PowerBI.CanadaCentral` CIDRs used as the source of truth for
   comparisons.
@@ -71,7 +80,7 @@ flow, with a few files providing the data and the execution logic.
   `actions.add` and `actions.remove` entries plus `dateUpdated`.
 - `ServiceTags_Public_20260824.json` - a seed/downloaded sample file used to
   validate the workflow logic locally and to bootstrap the initial snapshot.
-- `tests/test_ip_allow_list.py` - regression tests that validate discovery,
+- `tests/test_ip_allow_list.py` - regression tests that validate downloads,
   CIDR extraction, snapshot comparison, and payload validation behavior.
 - `tests/fixtures/` - sample service-tag payloads used by the tests.
 
@@ -87,7 +96,8 @@ complete normalized set of Canada Central Power BI CIDRs.
   the snapshot.
 - `actions.remove` contains CIDRs present in the snapshot but absent from the
   latest publication.
-- `dateUpdated` is the UTC date on which the delta was generated.
+- `dateUpdated` is the Azure publication date encoded in the source
+  `ServiceTags_Public_YYYYMMDD.json` filename.
 
 Both IPv4 and IPv6 CIDRs are preserved as networks and sorted deterministically.
 The action document is generated, committed through the automation pull
@@ -120,8 +130,10 @@ python scripts/ip_allow_list.py process \
   --summary ip-change-summary.md
 ```
 
-Download the latest publication:
+Download a specific publication:
 
 ```shell
-python scripts/ip_allow_list.py download --download-dir downloads
+python scripts/ip_allow_list.py download \
+  --download-url https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63/ServiceTags_Public_20260824.json \
+  --download-dir downloads
 ```

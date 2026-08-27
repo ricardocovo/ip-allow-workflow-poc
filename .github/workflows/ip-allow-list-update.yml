@@ -2,6 +2,11 @@ name: IP Allow List Update
 
 on:
   workflow_dispatch:
+    inputs:
+      date:
+        description: Optional Service Tags publication date (YYYYMMDD)
+        required: false
+        type: string
   schedule:
     - cron: "17 */4 * * *"
 
@@ -17,6 +22,7 @@ jobs:
   download:
     runs-on: ubuntu-latest
     outputs:
+      available: ${{ steps.download.outputs.available }}
       artifact-name: ${{ steps.artifact.outputs.name }}
     steps:
       - name: Check out repository
@@ -27,20 +33,53 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download latest Service Tags
+      - name: Resolve Service Tags URL
+        id: source
+        env:
+          REQUESTED_DATE: ${{ github.event.inputs.date || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_date="$REQUESTED_DATE"
+          if [[ -z "$source_date" ]]; then
+            source_date="$(date -u +%Y%m%d)"
+          elif [[ ! "$source_date" =~ ^[0-9]{8}$ ]]; then
+            echo "The date input must use YYYYMMDD format." >&2
+            exit 1
+          else
+            normalized_date="$(
+              date -u -d "${source_date:0:4}-${source_date:4:2}-${source_date:6:2}" +%Y%m%d 2>/dev/null
+            )" || {
+              echo "The date input must be a valid calendar date." >&2
+              exit 1
+            }
+            if [[ "$normalized_date" != "$source_date" ]]; then
+              echo "The date input must be a valid calendar date." >&2
+              exit 1
+            fi
+          fi
+
+          base_url="https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63"
+          echo "source_date=$source_date" >> "$GITHUB_OUTPUT"
+          echo "download_url=${base_url}/ServiceTags_Public_${source_date}.json" >> "$GITHUB_OUTPUT"
+
+      - name: Download Service Tags
         id: download
         run: >-
           python scripts/ip_allow_list.py download
+          --download-url "${{ steps.source.outputs.download_url }}"
           --download-dir "${{ runner.temp }}/service-tags"
           --github-output "$GITHUB_OUTPUT"
 
       - name: Set artifact name
+        if: steps.download.outputs.available == 'true'
         id: artifact
         env:
-          SOURCE_DATE: ${{ steps.download.outputs.source_date }}
+          SOURCE_DATE: ${{ steps.source.outputs.source_date }}
         run: echo "name=azure-service-tags-${SOURCE_DATE}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Service Tags artifact
+        if: steps.download.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifact.outputs.name }}
@@ -50,6 +89,7 @@ jobs:
 
   process:
     needs: download
+    if: needs.download.outputs.available == 'true'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.process.outputs.changed }}

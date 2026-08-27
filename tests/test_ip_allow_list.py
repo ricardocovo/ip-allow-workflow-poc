@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,18 +18,104 @@ from scripts import ip_allow_list
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-class DownloadDiscoveryTests(unittest.TestCase):
-    def test_finds_dated_links_and_selects_latest(self) -> None:
-        page = (FIXTURES / "download-page.html").read_text(encoding="utf-8")
+class DownloadTests(unittest.TestCase):
+    DOWNLOAD_URL = (
+        "https://download.microsoft.com/download/7/1/d/example/"
+        "ServiceTags_Public_20260824.json"
+    )
 
-        urls = ip_allow_list.find_download_urls(page)
+    def test_downloads_explicit_url_and_writes_outputs(self) -> None:
+        payload = (FIXTURES / "service-tags.json").read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "github-output"
 
-        self.assertEqual(2, len(urls))
-        latest = ip_allow_list.select_latest_download_url(urls)
-        self.assertTrue(latest.endswith("ServiceTags_Public_20260824.json"))
+            with patch.object(ip_allow_list, "_request_bytes", return_value=payload):
+                result = ip_allow_list.main(
+                    [
+                        "download",
+                        "--download-url",
+                        self.DOWNLOAD_URL,
+                        "--download-dir",
+                        str(root / "downloads"),
+                        "--github-output",
+                        str(output),
+                    ]
+                )
 
-    def test_rejects_page_without_download_link(self) -> None:
-        self.assertEqual([], ip_allow_list.find_download_urls("<html></html>"))
+            self.assertEqual(0, result)
+            downloaded = root / "downloads" / "ServiceTags_Public_20260824.json"
+            self.assertEqual(payload, downloaded.read_bytes())
+            self.assertEqual(
+                {
+                    "available=true",
+                    f"download_path={downloaded}",
+                    "source_filename=ServiceTags_Public_20260824.json",
+                    "source_date=20260824",
+                },
+                set(output.read_text(encoding="utf-8").splitlines()),
+            )
+
+    def test_http_404_is_a_successful_noop(self) -> None:
+        error = HTTPError(self.DOWNLOAD_URL, 404, "Not Found", {}, None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "github-output"
+
+            with (
+                patch("scripts.ip_allow_list.urlopen", side_effect=error),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = ip_allow_list.main(
+                    [
+                        "download",
+                        "--download-url",
+                        self.DOWNLOAD_URL,
+                        "--download-dir",
+                        str(root / "downloads"),
+                        "--github-output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(0, result)
+            self.assertEqual("available=false\n", output.read_text(encoding="utf-8"))
+            self.assertFalse((root / "downloads").exists())
+
+    def test_non_404_http_error_fails(self) -> None:
+        error = HTTPError(self.DOWNLOAD_URL, 503, "Unavailable", {}, None)
+        with patch("scripts.ip_allow_list.urlopen", side_effect=error):
+            with self.assertRaisesRegex(ip_allow_list.ServiceTagsError, "HTTP 503"):
+                ip_allow_list._request_bytes(self.DOWNLOAD_URL)
+
+    def test_rejects_unexpected_download_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ip_allow_list.ServiceTagsError, "unexpected filename"
+            ):
+                ip_allow_list.download_service_tags(
+                    Path(directory),
+                    "https://download.microsoft.com/download/service-tags.json",
+                )
+
+    def test_rejects_malformed_download_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ip_allow_list.ServiceTagsError, "valid HTTPS URL"
+            ):
+                ip_allow_list.download_service_tags(
+                    Path(directory), "ServiceTags_Public_20260824.json"
+                )
+
+    def test_rejects_invalid_json_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(ip_allow_list, "_request_bytes", return_value=b"invalid"),
+                self.assertRaisesRegex(ip_allow_list.ServiceTagsError, "not valid JSON"),
+            ):
+                ip_allow_list.download_service_tags(
+                    Path(directory), self.DOWNLOAD_URL
+                )
 
 
 class PrefixProcessingTests(unittest.TestCase):
@@ -84,14 +174,12 @@ class PrefixProcessingTests(unittest.TestCase):
                 },
             )
 
-            outputs = ip_allow_list.process_file(
-                source, snapshot, actions, summary, "2026-08-27"
-            )
+            outputs = ip_allow_list.process_file(source, snapshot, actions, summary)
 
             self.assertEqual("true", outputs["changed"])
             self.assertEqual(
                 {
-                    "dateUpdated": "2026-08-27",
+                    "dateUpdated": "2026-08-24",
                     "actions": {
                         "remove": ["192.0.2.0/24"],
                         "add": ["20.48.202.16/29", "2603:1030:f05::/122"],
@@ -121,9 +209,7 @@ class PrefixProcessingTests(unittest.TestCase):
             )
             original_snapshot = snapshot.read_bytes()
 
-            outputs = ip_allow_list.process_file(
-                source, snapshot, actions, summary, "2026-08-27"
-            )
+            outputs = ip_allow_list.process_file(source, snapshot, actions, summary)
 
             self.assertEqual("false", outputs["changed"])
             self.assertFalse(actions.exists())
@@ -159,7 +245,6 @@ class PrefixProcessingTests(unittest.TestCase):
                 pending_snapshot,
                 actions,
                 summary,
-                "2026-08-27",
                 main_snapshot,
             )
 
@@ -197,7 +282,6 @@ class PrefixProcessingTests(unittest.TestCase):
                 pending_snapshot,
                 actions,
                 summary,
-                "2026-08-27",
                 main_snapshot,
             )
 
