@@ -19,7 +19,7 @@ can also be started manually through `workflow_dispatch`. In each run it:
    them into a deterministic list of CIDRs.
 4. Compares the live values with the committed snapshot in
    `data/powerbi-canadacentral-prefixes.json`.
-5. Skips all PR and ticket work if there is no real change.
+5. Skips all PR, action-file, and ticket work if there is no real change.
 6. Creates or updates an automation pull request when the set of CIDRs changes.
    The PR includes the new snapshot and an `ip-manage-actions.json` delta file.
 7. Posts a PR comment summarizing added and removed CIDRs.
@@ -90,7 +90,10 @@ complete normalized set of Canada Central Power BI CIDRs.
 - `dateUpdated` is the UTC date on which the delta was generated.
 
 Both IPv4 and IPv6 CIDRs are preserved as networks and sorted deterministically.
-The downloaded Service Tags export is not committed by the workflow.
+The action document is generated, committed through the automation pull
+request, and published as the `ip-manage-actions` artifact only when there is a
+non-empty delta. The downloaded Service Tags export is not committed by the
+workflow.
 
 ## SNOW mock
 
