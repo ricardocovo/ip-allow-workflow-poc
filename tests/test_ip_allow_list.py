@@ -255,6 +255,44 @@ class PrefixProcessingTests(unittest.TestCase):
                 action_document["actions"]["add"],
             )
 
+    def test_repeated_pending_proposal_rebuilds_desired_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "ServiceTags_Public_20260824.json"
+            pending_snapshot = root / "pending.json"
+            main_snapshot = root / "main.json"
+            actions = root / "actions.json"
+            summary = root / "summary.md"
+            source.write_text(json.dumps(self.document), encoding="utf-8")
+            live = ip_allow_list.extract_prefixes(self.document)
+            ip_allow_list.write_json(
+                pending_snapshot,
+                {"serviceTag": ip_allow_list.SERVICE_TAG_NAME, "prefixes": live},
+            )
+            ip_allow_list.write_json(
+                main_snapshot,
+                {
+                    "serviceTag": ip_allow_list.SERVICE_TAG_NAME,
+                    "prefixes": ["4.206.229.128/27"],
+                },
+            )
+
+            outputs = ip_allow_list.process_file(
+                source,
+                pending_snapshot,
+                actions,
+                summary,
+                main_snapshot,
+            )
+
+            self.assertEqual("false", outputs["changed"])
+            self.assertEqual("true", outputs["has_delta"])
+            self.assertEqual(live, ip_allow_list.load_snapshot(pending_snapshot))
+            self.assertEqual(
+                ["20.48.202.16/29", "2603:1030:f05::/122"],
+                json.loads(actions.read_text(encoding="utf-8"))["actions"]["add"],
+            )
+
     def test_reverted_proposal_does_not_publish_empty_actions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -276,6 +314,7 @@ class PrefixProcessingTests(unittest.TestCase):
                 main_snapshot,
                 {"serviceTag": ip_allow_list.SERVICE_TAG_NAME, "prefixes": live},
             )
+            main_snapshot_bytes = main_snapshot.read_bytes()
 
             outputs = ip_allow_list.process_file(
                 source,
@@ -286,7 +325,9 @@ class PrefixProcessingTests(unittest.TestCase):
             )
 
             self.assertEqual("false", outputs["changed"])
+            self.assertEqual("false", outputs["has_delta"])
             self.assertFalse(actions.exists())
+            self.assertEqual(main_snapshot_bytes, pending_snapshot.read_bytes())
 
 
 class SnowMockTests(unittest.TestCase):

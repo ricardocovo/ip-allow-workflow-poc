@@ -217,6 +217,14 @@ def write_text(path: Path, content: str) -> None:
     _write_bytes(path, content.encode("utf-8"))
 
 
+def copy_file(source: Path, destination: Path) -> None:
+    try:
+        content = source.read_bytes()
+    except OSError as exc:
+        raise ServiceTagsError(f"Unable to read {source}: {exc}") from exc
+    _write_bytes(destination, content)
+
+
 def write_github_outputs(path: Path | None, values: dict[str, str]) -> None:
     if path is None:
         return
@@ -248,19 +256,19 @@ def process_file(
     )
     added, removed = compare_prefixes(current, action_baseline)
 
-    # Publish only when the live data moved since the last proposal *and* that
-    # leaves a non-empty delta against the merged baseline. A publication that
-    # reverts an unmerged proposal satisfies the first test but not the second,
-    # and must not raise an empty pull request or SNOW entry.
-    changed = bool((observed_added or observed_removed) and (added or removed))
+    has_delta = bool(added or removed)
+    changed = bool((observed_added or observed_removed) and has_delta)
 
     write_text(summary_path, build_summary(added, removed))
-    if changed:
+    if has_delta:
         write_json(actions_path, build_actions(added, removed, source_date(source.name)))
         write_json(snapshot_path, build_snapshot(current, source.name))
+    elif action_baseline_path is not None:
+        copy_file(action_baseline_path, snapshot_path)
 
     return {
         "changed": str(changed).lower(),
+        "has_delta": str(has_delta).lower(),
         "added_count": str(len(added)),
         "removed_count": str(len(removed)),
         "summary_path": str(summary_path),

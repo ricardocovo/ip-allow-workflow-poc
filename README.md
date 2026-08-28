@@ -19,11 +19,15 @@ can also be started manually through `workflow_dispatch`. In each run it:
    them into a deterministic list of CIDRs.
 4. Compares the live values with the committed snapshot in
    `data/powerbi-canadacentral-prefixes.json`.
-5. Skips all PR, action-file, and ticket work if there is no real change.
-6. Creates or updates an automation pull request when the set of CIDRs changes.
-   The PR includes the new snapshot and an `ip-manage-actions.json` delta file.
-7. Posts a PR comment summarizing added and removed CIDRs.
-8. Calls the mocked SNOW integration step with the action payload.
+5. Finds automation PRs for the target branch, keeps the newest one, and closes
+   older duplicates.
+6. Creates or updates one automation pull request when the set of CIDRs differs
+   from the target branch. The PR includes the latest snapshot and an
+   `ip-manage-actions.json` delta file.
+7. Closes the active automation PR if the latest publication no longer differs
+   from the target branch.
+8. Posts a PR comment and calls the mocked SNOW integration only when a new
+   non-empty delta updates the proposal.
 
 Microsoft does not publish a Service Tags file every day. If the constructed URL
 returns HTTP 404, the workflow finishes successfully without uploading an
@@ -38,26 +42,34 @@ flowchart TD
     B --> C{Publication available?}
     C -- No, HTTP 404 --> D[Finish successfully]
     C -- Yes --> E[Upload source JSON as an artifact]
-    E --> F{Open automation PR?}
-    F -- Yes --> G[Use the PR snapshot as the processing baseline]
-    F -- No --> H[Use the default branch snapshot]
-    G --> I[Extract and normalize Power BI Canada Central CIDRs]
-    H --> I
-    I --> J{CIDR set changed?}
-    J -- No --> K[Finish without a PR or SNOW entry]
-    J -- Yes --> L[Create or update the automation PR]
-    L --> M[Comment with added and removed CIDRs]
-    M --> N[Call the mocked SNOW integration]
+    E --> F[Keep newest automation PR and close duplicates]
+    F --> G{Open automation PR?}
+    G -- Yes --> H[Use the PR snapshot as the processing baseline]
+    G -- No --> I[Use the target branch snapshot]
+    H --> J[Extract and normalize Power BI Canada Central CIDRs]
+    I --> J
+    J --> K{Net change from target branch?}
+    K -- No --> L[Close obsolete PR and delete its branch]
+    K -- Yes --> M[Create or update the active automation PR]
+    M --> N{Proposal changed this run?}
+    N -- No --> O[Finish without duplicate side effects]
+    N -- Yes --> P[Comment with CIDR changes]
+    P --> Q[Call the mocked SNOW integration]
 ```
 
-The automation is designed to handle open PRs safely. Each target branch uses an
-automation branch named `automation/ip-allow-list-update-<target-branch>`. If a
-proposal is already in progress, the workflow uses that automation branch's
-snapshot as the comparison baseline to avoid repeating the same change before it
-is merged. The `add`/`remove` entries still compare against the target branch
-state, so the PR always shows the full net change relative to the merged result.
-If a later service-tag publication reverts an unmerged change, no PR or SNOW
-entry is created because the effective change is empty.
+The automation maintains at most one IP allow-list PR per target branch. New
+proposals use a branch named
+`automation/ip-allow-list-update-<target-branch>`. If matching PRs already
+exist, the workflow retains the newest PR and closes older duplicates before
+processing. It reuses the retained PR's head branch and snapshot, so each later
+publication updates that PR instead of opening another one.
+
+The `add`/`remove` entries always compare the latest publication against the
+target branch, so the active PR shows the complete net change relative to the
+merged result. Rerunning the same publication leaves the PR unchanged and does
+not add another comment or SNOW entry. If a later publication reverts all
+unmerged changes, the workflow restores the target state, closes the obsolete
+PR, and deletes its automation branch.
 
 The repository must allow GitHub Actions to create pull requests. If that
 setting cannot be enabled, configure an `IP_ALLOW_LIST_PR_TOKEN` Actions secret

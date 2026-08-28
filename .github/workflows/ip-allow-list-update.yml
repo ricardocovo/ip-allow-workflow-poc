@@ -15,7 +15,10 @@ permissions:
   pull-requests: write
 
 env:
+  AUTOMATION_BRANCH_PREFIX: automation/ip-allow-list-update-
   AUTOMATION_BRANCH: automation/ip-allow-list-update-${{ github.ref_name }}
+  AUTOMATION_PR_TITLE: Update Power BI Canada Central IP allow list
+  LEGACY_AUTOMATION_BRANCH: automation/ip-allow-list-update
   TARGET_BRANCH: ${{ github.ref_name }}
 
 concurrency:
@@ -113,13 +116,72 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  reconcile-prs:
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.automation-pr.outputs.branch }}
+      pull-request-number: ${{ steps.automation-pr.outputs.pull-request-number }}
+    steps:
+      - name: Resolve active automation pull request
+        id: automation-pr
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.IP_ALLOW_LIST_PR_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          matching_prs="$(
+            gh pr list \
+              --base "$TARGET_BRANCH" \
+              --state open \
+              --limit 1000 \
+              --json number,headRefName,createdAt,isCrossRepository |
+              jq \
+                --arg legacy_branch "$LEGACY_AUTOMATION_BRANCH" \
+                --arg prefix "$AUTOMATION_BRANCH_PREFIX" \
+                '[
+                  .[]
+                  | select(
+                      .isCrossRepository == false
+                      and (
+                        .headRefName == $legacy_branch
+                        or (.headRefName | startswith($prefix))
+                      )
+                    )
+                ] | sort_by(.createdAt) | reverse'
+          )"
+          pr_count="$(jq 'length' <<< "$matching_prs")"
+          active_branch="$AUTOMATION_BRANCH"
+          active_pr_number=""
+
+          if [[ "$pr_count" -gt 0 ]]; then
+            active_branch="$(jq -r '.[0].headRefName' <<< "$matching_prs")"
+            active_pr_number="$(jq -r '.[0].number' <<< "$matching_prs")"
+          fi
+
+          echo "::notice title=PR lookup::found=${pr_count}, active_pr=${active_pr_number:-none}, active_branch=${active_branch}, base=${TARGET_BRANCH}"
+
+          while IFS=$'\t' read -r duplicate_number duplicate_branch; do
+            [[ -n "$duplicate_number" ]] || continue
+            echo "::warning title=Closing duplicate PR::PR #${duplicate_number} from ${duplicate_branch} is superseded by #${active_pr_number}"
+            gh pr close "$duplicate_number" \
+              --delete-branch \
+              --comment "Closed automatically because #${active_pr_number} is the newest IP allow-list automation PR for \`${TARGET_BRANCH}\`."
+          done < <(jq -r '.[1:][] | [.number, .headRefName] | @tsv' <<< "$matching_prs")
+
+          echo "branch=$active_branch" >> "$GITHUB_OUTPUT"
+          echo "pull-request-number=$active_pr_number" >> "$GITHUB_OUTPUT"
+
   process:
-    needs: download
+    needs:
+      - download
+      - reconcile-prs
     if: needs.download.outputs.available == 'true'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.process.outputs.changed }}
       pull-request-number: ${{ steps.pull-request.outputs.pull-request-number }}
+      pull-request-operation: ${{ steps.pull-request.outputs.pull-request-operation }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -133,9 +195,10 @@ jobs:
 
       - name: Log processing context
         env:
+          ACTIVE_AUTOMATION_BRANCH: ${{ needs.reconcile-prs.outputs.branch }}
           ARTIFACT_NAME: ${{ needs.download.outputs.artifact-name }}
         run: |
-          echo "::notice title=Processing context::artifact=${ARTIFACT_NAME}, target=${TARGET_BRANCH}, automation=${AUTOMATION_BRANCH}"
+          echo "::notice title=Processing context::artifact=${ARTIFACT_NAME}, target=${TARGET_BRANCH}, automation=${ACTIVE_AUTOMATION_BRANCH}"
 
       - name: Download Service Tags artifact
         uses: actions/download-artifact@v5
@@ -156,32 +219,20 @@ jobs:
           echo "path=${source_files[0]}" >> "$GITHUB_OUTPUT"
           echo "::notice title=Source located::${source_files[0]}"
 
-      - name: Use snapshot from an open automation PR
+      - name: Select processing baseline
         env:
-          GH_TOKEN: ${{ github.token }}
+          ACTIVE_AUTOMATION_BRANCH: ${{ needs.reconcile-prs.outputs.branch }}
+          ACTIVE_PR_NUMBER: ${{ needs.reconcile-prs.outputs.pull-request-number }}
         shell: bash
         run: |
           set -euo pipefail
           cp data/powerbi-canadacentral-prefixes.json \
             "${RUNNER_TEMP}/main-powerbi-canadacentral-prefixes.json"
-          open_prs="$(
-            gh pr list \
-              --head "$AUTOMATION_BRANCH" \
-              --base "$TARGET_BRANCH" \
-              --state open \
-              --json number \
-              --jq 'length'
-          )"
-          echo "::notice title=PR lookup::found=${open_prs}, head=${AUTOMATION_BRANCH}, base=${TARGET_BRANCH}"
-          if [[ "$open_prs" -gt 1 ]]; then
-            echo "Expected at most one open automation PR; found $open_prs" >&2
-            exit 1
-          fi
-          if [[ "$open_prs" -eq 1 ]]; then
-            git fetch --no-tags origin "$AUTOMATION_BRANCH"
+          if [[ -n "$ACTIVE_PR_NUMBER" ]]; then
+            git fetch --no-tags origin "$ACTIVE_AUTOMATION_BRANCH"
             git show FETCH_HEAD:data/powerbi-canadacentral-prefixes.json > snapshot.tmp
             mv snapshot.tmp data/powerbi-canadacentral-prefixes.json
-            echo "::notice title=Baseline selected::Using the snapshot from ${AUTOMATION_BRANCH}"
+            echo "::notice title=Baseline selected::Using the snapshot from ${ACTIVE_AUTOMATION_BRANCH} (PR #${ACTIVE_PR_NUMBER})"
           else
             echo "::notice title=Baseline selected::Using the snapshot from ${TARGET_BRANCH}"
           fi
@@ -201,16 +252,17 @@ jobs:
         env:
           ADDED_COUNT: ${{ steps.process.outputs.added_count }}
           CHANGED: ${{ steps.process.outputs.changed }}
+          HAS_DELTA: ${{ steps.process.outputs.has_delta }}
           REMOVED_COUNT: ${{ steps.process.outputs.removed_count }}
           SUMMARY_PATH: ${{ steps.process.outputs.summary_path }}
         run: |
-          echo "::notice title=Allow-list comparison::changed=${CHANGED}, added=${ADDED_COUNT}, removed=${REMOVED_COUNT}"
+          echo "::notice title=Allow-list comparison::changed=${CHANGED}, has_delta=${HAS_DELTA}, added=${ADDED_COUNT}, removed=${REMOVED_COUNT}"
           {
             echo "## IP allow-list update"
             echo
-            echo "| Target branch | Changed | Added | Removed |"
-            echo "| --- | --- | ---: | ---: |"
-            echo "| \`${TARGET_BRANCH}\` | ${CHANGED} | ${ADDED_COUNT} | ${REMOVED_COUNT} |"
+            echo "| Target branch | New change | Has delta | Added | Removed |"
+            echo "| --- | --- | --- | ---: | ---: |"
+            echo "| \`${TARGET_BRANCH}\` | ${CHANGED} | ${HAS_DELTA} | ${ADDED_COUNT} | ${REMOVED_COUNT} |"
             if [[ -f "$SUMMARY_PATH" ]]; then
               echo
               cat "$SUMMARY_PATH"
@@ -218,16 +270,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create or update pull request
-        if: steps.process.outputs.changed == 'true'
         id: pull-request
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.IP_ALLOW_LIST_PR_TOKEN || github.token }}
-          branch: ${{ env.AUTOMATION_BRANCH }}
+          branch: ${{ needs.reconcile-prs.outputs.branch }}
           base: ${{ env.TARGET_BRANCH }}
           delete-branch: true
           commit-message: Update Power BI Canada Central IP allow list
-          title: Update Power BI Canada Central IP allow list
+          title: ${{ env.AUTOMATION_PR_TITLE }}
           body: |
             Automated update from the latest Azure Public Service Tags publication.
 
@@ -237,22 +288,30 @@ jobs:
             ip-manage-actions.json
 
       - name: Log pull request result
-        if: steps.process.outputs.changed == 'true'
         env:
           PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
           PR_OPERATION: ${{ steps.pull-request.outputs.pull-request-operation }}
           PR_URL: ${{ steps.pull-request.outputs.pull-request-url }}
         run: |
-          if [[ -n "$PR_NUMBER" ]]; then
-            echo "::notice title=Pull request ${PR_OPERATION}::number=${PR_NUMBER}, url=${PR_URL}"
-          else
-            echo "::notice title=Pull request unchanged::The automation branch has no additional commit to propose"
-          fi
+          case "$PR_OPERATION" in
+            created|updated)
+              echo "::notice title=Pull request ${PR_OPERATION}::number=${PR_NUMBER}, url=${PR_URL}"
+              ;;
+            closed)
+              echo "::notice title=Pull request closed::The latest publication has no net change for ${TARGET_BRANCH}"
+              ;;
+            *)
+              echo "::notice title=Pull request unchanged::The active proposal already reflects the latest publication"
+              ;;
+          esac
 
       - name: Comment with IP address changes
         if: >-
           steps.process.outputs.changed == 'true' &&
-          steps.pull-request.outputs.pull-request-number != ''
+          (
+            steps.pull-request.outputs.pull-request-operation == 'created' ||
+            steps.pull-request.outputs.pull-request-operation == 'updated'
+          )
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
@@ -264,7 +323,10 @@ jobs:
       - name: Upload IP management actions
         if: >-
           steps.process.outputs.changed == 'true' &&
-          steps.pull-request.outputs.pull-request-number != ''
+          (
+            steps.pull-request.outputs.pull-request-operation == 'created' ||
+            steps.pull-request.outputs.pull-request-operation == 'updated'
+          )
         uses: actions/upload-artifact@v4
         with:
           name: ip-manage-actions
@@ -276,7 +338,10 @@ jobs:
     needs: process
     if: >-
       needs.process.outputs.changed == 'true' &&
-      needs.process.outputs.pull-request-number != ''
+      (
+        needs.process.outputs.pull-request-operation == 'created' ||
+        needs.process.outputs.pull-request-operation == 'updated'
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
