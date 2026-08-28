@@ -84,7 +84,7 @@ jobs:
       - name: Download Service Tags
         id: download
         run: >-
-          python scripts/ip_allow_list.py download
+          python scripts/download.py
           --download-url "${{ steps.source.outputs.download_url }}"
           --download-dir "${{ runner.temp }}/service-tags"
           --github-output "$GITHUB_OUTPUT"
@@ -240,7 +240,7 @@ jobs:
       - name: Build IP allow-list actions
         id: process
         run: >-
-          python scripts/ip_allow_list.py process
+          python scripts/process.py
           --source "${{ steps.source.outputs.path }}"
           --snapshot data/powerbi-canadacentral-prefixes.json
           --action-baseline "${{ runner.temp }}/main-powerbi-canadacentral-prefixes.json"
@@ -364,5 +364,5 @@ jobs:
           PR_NUMBER: ${{ needs.process.outputs.pull-request-number }}
         run: |
           echo "::notice title=SNOW request::Creating an entry from PR #${PR_NUMBER} using ${ACTIONS_PATH}"
-          python scripts/ip_allow_list.py create-snow-entry --actions "$ACTIONS_PATH"
+          python scripts/create_snow_entry.py --actions "$ACTIONS_PATH"
           echo "::notice title=SNOW result::Mock entry created successfully"

@@ -83,9 +83,12 @@ flow, with a few files providing the data and the execution logic.
 
 - `.github/workflows/ip-allow-list-update.yml` - defines the scheduled/manual
   GitHub Actions pipeline and the approval/PR flow.
-- `scripts/ip_allow_list.py` - Python entry point that downloads an Azure
-  Service Tags URL, normalizes CIDRs, compares snapshots, writes the delta
-  action file, and mocks the SNOW API call.
+- `scripts/download.py` - downloads and validates an Azure Service Tags
+  publication.
+- `scripts/process.py` - normalizes CIDRs, compares snapshots, and writes the
+  delta action file.
+- `scripts/create_snow_entry.py` - validates the delta and mocks the SNOW API
+  call.
 - `data/powerbi-canadacentral-prefixes.json` - the checked-in snapshot of the
   currently approved `PowerBI.CanadaCentral` CIDRs used as the source of truth for
   comparisons.
@@ -120,7 +123,7 @@ workflow.
 
 ## SNOW mock
 
-`scripts/ip_allow_list.py` exposes `create_snow_entry(payload)` as the integration
+`scripts/create_snow_entry.py` exposes `create_snow_entry(payload)` as the integration
 boundary for a future API client. The current implementation validates the
 action payload and always returns a mocked success response without making a
 network request.
@@ -136,7 +139,7 @@ python -m unittest discover -s tests -v
 Process the included sample against the seeded snapshot:
 
 ```shell
-python scripts/ip_allow_list.py process \
+python scripts/process.py \
   --source ServiceTags_Public_20260824.json \
   --snapshot data/powerbi-canadacentral-prefixes.json \
   --actions ip-manage-actions.json \
@@ -146,7 +149,7 @@ python scripts/ip_allow_list.py process \
 Download a specific publication:
 
 ```shell
-python scripts/ip_allow_list.py download \
+python scripts/download.py \
   --download-url https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63/ServiceTags_Public_20260824.json \
   --download-dir downloads
 ```

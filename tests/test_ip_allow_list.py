@@ -12,7 +12,7 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts import ip_allow_list
+from scripts import create_snow_entry, download, process
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -30,10 +30,9 @@ class DownloadTests(unittest.TestCase):
             root = Path(directory)
             output = root / "github-output"
 
-            with patch.object(ip_allow_list, "_request_bytes", return_value=payload):
-                result = ip_allow_list.main(
+            with patch.object(download, "_request_bytes", return_value=payload):
+                result = download.main(
                     [
-                        "download",
                         "--download-url",
                         self.DOWNLOAD_URL,
                         "--download-dir",
@@ -63,12 +62,11 @@ class DownloadTests(unittest.TestCase):
             output = root / "github-output"
 
             with (
-                patch("scripts.ip_allow_list.urlopen", side_effect=error),
+                patch("scripts.download.urlopen", side_effect=error),
                 redirect_stderr(io.StringIO()),
             ):
-                result = ip_allow_list.main(
+                result = download.main(
                     [
-                        "download",
                         "--download-url",
                         self.DOWNLOAD_URL,
                         "--download-dir",
@@ -84,16 +82,16 @@ class DownloadTests(unittest.TestCase):
 
     def test_non_404_http_error_fails(self) -> None:
         error = HTTPError(self.DOWNLOAD_URL, 503, "Unavailable", {}, None)
-        with patch("scripts.ip_allow_list.urlopen", side_effect=error):
-            with self.assertRaisesRegex(ip_allow_list.ServiceTagsError, "HTTP 503"):
-                ip_allow_list._request_bytes(self.DOWNLOAD_URL)
+        with patch("scripts.download.urlopen", side_effect=error):
+            with self.assertRaisesRegex(download.ServiceTagsError, "HTTP 503"):
+                download._request_bytes(self.DOWNLOAD_URL)
 
     def test_rejects_unexpected_download_filename(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
-                ip_allow_list.ServiceTagsError, "unexpected filename"
+                download.ServiceTagsError, "unexpected filename"
             ):
-                ip_allow_list.download_service_tags(
+                download.download_service_tags(
                     Path(directory),
                     "https://download.microsoft.com/download/service-tags.json",
                 )
@@ -101,19 +99,19 @@ class DownloadTests(unittest.TestCase):
     def test_rejects_malformed_download_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
-                ip_allow_list.ServiceTagsError, "valid HTTPS URL"
+                download.ServiceTagsError, "valid HTTPS URL"
             ):
-                ip_allow_list.download_service_tags(
+                download.download_service_tags(
                     Path(directory), "ServiceTags_Public_20260824.json"
                 )
 
     def test_rejects_invalid_json_download(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with (
-                patch.object(ip_allow_list, "_request_bytes", return_value=b"invalid"),
-                self.assertRaisesRegex(ip_allow_list.ServiceTagsError, "not valid JSON"),
+                patch.object(download, "_request_bytes", return_value=b"invalid"),
+                self.assertRaisesRegex(download.ServiceTagsError, "not valid JSON"),
             ):
-                ip_allow_list.download_service_tags(
+                download.download_service_tags(
                     Path(directory), self.DOWNLOAD_URL
                 )
 
@@ -125,7 +123,7 @@ class PrefixProcessingTests(unittest.TestCase):
         )
 
     def test_extracts_only_canada_central_and_normalizes(self) -> None:
-        prefixes = ip_allow_list.extract_prefixes(self.document)
+        prefixes = process.extract_prefixes(self.document)
 
         self.assertEqual(
             [
@@ -137,7 +135,7 @@ class PrefixProcessingTests(unittest.TestCase):
         )
 
     def test_compares_added_and_removed_prefixes(self) -> None:
-        added, removed = ip_allow_list.compare_prefixes(
+        added, removed = process.compare_prefixes(
             ["10.0.0.0/24", "2001:db8::/32"],
             ["10.0.0.0/24", "192.0.2.0/24"],
         )
@@ -146,17 +144,17 @@ class PrefixProcessingTests(unittest.TestCase):
         self.assertEqual(["192.0.2.0/24"], removed)
 
     def test_rejects_missing_duplicate_and_invalid_tags(self) -> None:
-        with self.assertRaisesRegex(ip_allow_list.ServiceTagsError, "found 0"):
-            ip_allow_list.extract_prefixes({"values": []})
+        with self.assertRaisesRegex(process.ServiceTagsError, "found 0"):
+            process.extract_prefixes({"values": []})
 
         duplicate = {"values": [self.document["values"][1], self.document["values"][1]]}
-        with self.assertRaisesRegex(ip_allow_list.ServiceTagsError, "found 2"):
-            ip_allow_list.extract_prefixes(duplicate)
+        with self.assertRaisesRegex(process.ServiceTagsError, "found 2"):
+            process.extract_prefixes(duplicate)
 
         invalid = json.loads(json.dumps(self.document))
         invalid["values"][1]["properties"]["addressPrefixes"] = ["not-a-cidr"]
-        with self.assertRaisesRegex(ip_allow_list.ServiceTagsError, "Invalid CIDR"):
-            ip_allow_list.extract_prefixes(invalid)
+        with self.assertRaisesRegex(process.ServiceTagsError, "Invalid CIDR"):
+            process.extract_prefixes(invalid)
 
     def test_process_file_writes_changed_documents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -166,15 +164,15 @@ class PrefixProcessingTests(unittest.TestCase):
             actions = root / "actions.json"
             summary = root / "summary.md"
             source.write_text(json.dumps(self.document), encoding="utf-8")
-            ip_allow_list.write_json(
+            process.write_json(
                 snapshot,
                 {
-                    "serviceTag": ip_allow_list.SERVICE_TAG_NAME,
+                    "serviceTag": process.SERVICE_TAG_NAME,
                     "prefixes": ["4.206.229.128/27", "192.0.2.0/24"],
                 },
             )
 
-            outputs = ip_allow_list.process_file(source, snapshot, actions, summary)
+            outputs = process.process_file(source, snapshot, actions, summary)
 
             self.assertEqual("true", outputs["changed"])
             self.assertEqual(
@@ -200,16 +198,16 @@ class PrefixProcessingTests(unittest.TestCase):
             actions = root / "actions.json"
             summary = root / "summary.md"
             source.write_text(json.dumps(self.document), encoding="utf-8")
-            ip_allow_list.write_json(
+            process.write_json(
                 snapshot,
                 {
-                    "serviceTag": ip_allow_list.SERVICE_TAG_NAME,
-                    "prefixes": ip_allow_list.extract_prefixes(self.document),
+                    "serviceTag": process.SERVICE_TAG_NAME,
+                    "prefixes": process.extract_prefixes(self.document),
                 },
             )
             original_snapshot = snapshot.read_bytes()
 
-            outputs = ip_allow_list.process_file(source, snapshot, actions, summary)
+            outputs = process.process_file(source, snapshot, actions, summary)
 
             self.assertEqual("false", outputs["changed"])
             self.assertFalse(actions.exists())
@@ -225,22 +223,22 @@ class PrefixProcessingTests(unittest.TestCase):
             actions = root / "actions.json"
             summary = root / "summary.md"
             source.write_text(json.dumps(self.document), encoding="utf-8")
-            ip_allow_list.write_json(
+            process.write_json(
                 pending_snapshot,
                 {
-                    "serviceTag": ip_allow_list.SERVICE_TAG_NAME,
+                    "serviceTag": process.SERVICE_TAG_NAME,
                     "prefixes": ["4.206.229.128/27", "20.48.202.16/29"],
                 },
             )
-            ip_allow_list.write_json(
+            process.write_json(
                 main_snapshot,
                 {
-                    "serviceTag": ip_allow_list.SERVICE_TAG_NAME,
+                    "serviceTag": process.SERVICE_TAG_NAME,
                     "prefixes": ["4.206.229.128/27"],
                 },
             )
 
-            outputs = ip_allow_list.process_file(
+            outputs = process.process_file(
                 source,
                 pending_snapshot,
                 actions,
@@ -264,20 +262,20 @@ class PrefixProcessingTests(unittest.TestCase):
             actions = root / "actions.json"
             summary = root / "summary.md"
             source.write_text(json.dumps(self.document), encoding="utf-8")
-            live = ip_allow_list.extract_prefixes(self.document)
-            ip_allow_list.write_json(
+            live = process.extract_prefixes(self.document)
+            process.write_json(
                 pending_snapshot,
-                {"serviceTag": ip_allow_list.SERVICE_TAG_NAME, "prefixes": live},
+                {"serviceTag": process.SERVICE_TAG_NAME, "prefixes": live},
             )
-            ip_allow_list.write_json(
+            process.write_json(
                 main_snapshot,
                 {
-                    "serviceTag": ip_allow_list.SERVICE_TAG_NAME,
+                    "serviceTag": process.SERVICE_TAG_NAME,
                     "prefixes": ["4.206.229.128/27"],
                 },
             )
 
-            outputs = ip_allow_list.process_file(
+            outputs = process.process_file(
                 source,
                 pending_snapshot,
                 actions,
@@ -287,7 +285,7 @@ class PrefixProcessingTests(unittest.TestCase):
 
             self.assertEqual("false", outputs["changed"])
             self.assertEqual("true", outputs["has_delta"])
-            self.assertEqual(live, ip_allow_list.load_snapshot(pending_snapshot))
+            self.assertEqual(live, process.load_snapshot(pending_snapshot))
             self.assertEqual(
                 ["20.48.202.16/29", "2603:1030:f05::/122"],
                 json.loads(actions.read_text(encoding="utf-8"))["actions"]["add"],
@@ -302,21 +300,21 @@ class PrefixProcessingTests(unittest.TestCase):
             actions = root / "actions.json"
             summary = root / "summary.md"
             source.write_text(json.dumps(self.document), encoding="utf-8")
-            live = ip_allow_list.extract_prefixes(self.document)
-            ip_allow_list.write_json(
+            live = process.extract_prefixes(self.document)
+            process.write_json(
                 pending_snapshot,
                 {
-                    "serviceTag": ip_allow_list.SERVICE_TAG_NAME,
+                    "serviceTag": process.SERVICE_TAG_NAME,
                     "prefixes": live + ["203.0.113.0/24"],
                 },
             )
-            ip_allow_list.write_json(
+            process.write_json(
                 main_snapshot,
-                {"serviceTag": ip_allow_list.SERVICE_TAG_NAME, "prefixes": live},
+                {"serviceTag": process.SERVICE_TAG_NAME, "prefixes": live},
             )
             main_snapshot_bytes = main_snapshot.read_bytes()
 
-            outputs = ip_allow_list.process_file(
+            outputs = process.process_file(
                 source,
                 pending_snapshot,
                 actions,
@@ -332,7 +330,7 @@ class PrefixProcessingTests(unittest.TestCase):
 
 class SnowMockTests(unittest.TestCase):
     def test_mock_returns_success_for_valid_actions(self) -> None:
-        result = ip_allow_list.create_snow_entry(
+        result = create_snow_entry.create_snow_entry(
             {
                 "dateUpdated": "2026-08-27",
                 "actions": {"add": ["192.0.2.0/24"], "remove": []},
@@ -342,8 +340,8 @@ class SnowMockTests(unittest.TestCase):
         self.assertEqual({"status": "success", "mock": True}, result)
 
     def test_mock_rejects_invalid_payload(self) -> None:
-        with self.assertRaisesRegex(ip_allow_list.ServiceTagsError, "actions.add"):
-            ip_allow_list.create_snow_entry(
+        with self.assertRaisesRegex(create_snow_entry.SnowEntryError, "actions.add"):
+            create_snow_entry.create_snow_entry(
                 {"dateUpdated": "2026-08-27", "actions": {"remove": [], "add": "bad"}}
             )
 

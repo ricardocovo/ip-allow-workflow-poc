@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download and process Azure Service Tags for Power BI."""
+"""Process Azure Service Tags into an IP allow-list delta."""
 
 from __future__ import annotations
 
@@ -12,9 +12,6 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
-from urllib.error import HTTPError
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 
 SERVICE_TAG_NAME = "PowerBI.CanadaCentral"
@@ -25,57 +22,6 @@ DOWNLOAD_PATTERN = re.compile(
 
 class ServiceTagsError(RuntimeError):
     """Raised when Service Tags data cannot be safely processed."""
-
-
-class ServiceTagsNotFound(ServiceTagsError):
-    """Raised when Microsoft has not published the requested dated file."""
-
-
-def _request_bytes(url: str, timeout: int = 30) -> bytes:
-    request = Request(url, headers={"User-Agent": "ip-allow-list-workflow/1.0"})
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            return response.read()
-    except HTTPError as exc:
-        if exc.code == 404:
-            raise ServiceTagsNotFound(
-                f"Service Tags publication was not found: {url}"
-            ) from exc
-        raise ServiceTagsError(
-            f"Unable to retrieve {url}: HTTP {exc.code} {exc.reason}"
-        ) from exc
-    except OSError as exc:
-        raise ServiceTagsError(f"Unable to retrieve {url}: {exc}") from exc
-
-
-def download_service_tags(download_dir: Path, download_url: str) -> Path:
-    parsed_url = urlparse(download_url)
-    if (
-        parsed_url.scheme != "https"
-        or not parsed_url.netloc
-        or any(character.isspace() for character in download_url)
-    ):
-        raise ServiceTagsError(
-            f"Download URL must be a valid HTTPS URL: {download_url}"
-        )
-
-    filename = Path(parsed_url.path).name
-    match = DOWNLOAD_PATTERN.fullmatch(filename)
-    if match is None:
-        raise ServiceTagsError(
-            f"Download URL has an unexpected filename: {download_url}"
-        )
-
-    destination = download_dir / match.group(0)
-    payload = _request_bytes(download_url)
-    try:
-        json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ServiceTagsError(
-            f"Downloaded file is not valid JSON: {download_url}"
-        ) from exc
-    _write_bytes(destination, payload)
-    return destination
 
 
 def _sort_networks(prefixes: Iterable[str]) -> list[str]:
@@ -209,8 +155,7 @@ def _write_bytes(path: Path, content: bytes) -> None:
 
 
 def write_json(path: Path, document: Any) -> None:
-    content = (json.dumps(document, indent=2) + "\n").encode("utf-8")
-    _write_bytes(path, content)
+    _write_bytes(path, (json.dumps(document, indent=2) + "\n").encode("utf-8"))
 
 
 def write_text(path: Path, content: str) -> None:
@@ -275,94 +220,31 @@ def process_file(
     }
 
 
-def validate_actions_payload(payload: Any) -> None:
-    if not isinstance(payload, dict) or not isinstance(payload.get("dateUpdated"), str):
-        raise ServiceTagsError("SNOW payload must contain a string dateUpdated")
-    actions = payload.get("actions")
-    if not isinstance(actions, dict):
-        raise ServiceTagsError("SNOW payload must contain an actions object")
-    for name in ("add", "remove"):
-        values = actions.get(name)
-        if not isinstance(values, list):
-            raise ServiceTagsError(f"SNOW payload actions.{name} must be an array")
-        _sort_networks(values)
-
-
-def create_snow_entry(payload: Any) -> dict[str, Any]:
-    """Mock the future SNOW API boundary while preserving its payload contract."""
-    validate_actions_payload(payload)
-    return {"status": "success", "mock": True}
-
-
-def _github_output_argument(value: str | None) -> Path | None:
-    return Path(value) if value else None
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    download = subparsers.add_parser("download", help="Download a Service Tags file")
-    download.add_argument("--download-url", required=True)
-    download.add_argument("--download-dir", type=Path, required=True)
-    download.add_argument("--github-output")
-
-    process = subparsers.add_parser("process", help="Build the IP allow-list delta")
-    process.add_argument("--source", type=Path, required=True)
-    process.add_argument("--snapshot", type=Path, required=True)
-    process.add_argument("--actions", type=Path, required=True)
-    process.add_argument("--summary", type=Path, required=True)
-    process.add_argument("--action-baseline", type=Path)
-    process.add_argument("--github-output")
-
-    snow = subparsers.add_parser("create-snow-entry", help="Call the mocked SNOW API")
-    snow.add_argument("--actions", type=Path, required=True)
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--actions", type=Path, required=True)
+    parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument("--action-baseline", type=Path)
+    parser.add_argument("--github-output")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        if args.command == "download":
-            try:
-                downloaded = download_service_tags(
-                    args.download_dir, args.download_url
-                )
-            except ServiceTagsNotFound as exc:
-                write_github_outputs(
-                    _github_output_argument(args.github_output),
-                    {"available": "false"},
-                )
-                print(f"notice: {exc}", file=sys.stderr)
-                return 0
-            date_match = DOWNLOAD_PATTERN.fullmatch(downloaded.name)
-            if date_match is None:
-                raise ServiceTagsError(
-                    f"Downloaded file has an unexpected name: {downloaded.name}"
-                )
-            write_github_outputs(
-                _github_output_argument(args.github_output),
-                {
-                    "available": "true",
-                    "download_path": str(downloaded),
-                    "source_filename": downloaded.name,
-                    "source_date": date_match.group("date"),
-                },
-            )
-            print(downloaded)
-        elif args.command == "process":
-            outputs = process_file(
-                args.source,
-                args.snapshot,
-                args.actions,
-                args.summary,
-                args.action_baseline,
-            )
-            write_github_outputs(_github_output_argument(args.github_output), outputs)
-            print(json.dumps(outputs))
-        else:
-            result = create_snow_entry(load_json(args.actions))
-            print(json.dumps(result))
+        outputs = process_file(
+            args.source,
+            args.snapshot,
+            args.actions,
+            args.summary,
+            args.action_baseline,
+        )
+        write_github_outputs(
+            Path(args.github_output) if args.github_output else None, outputs
+        )
+        print(json.dumps(outputs))
     except ServiceTagsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
