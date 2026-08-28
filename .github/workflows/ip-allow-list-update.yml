@@ -37,6 +37,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Log workflow context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          echo "::notice title=Workflow context::event=${EVENT_NAME}, run=${RUN_NUMBER}, attempt=${RUN_ATTEMPT}"
+          echo "::notice title=Branch context::target=${TARGET_BRANCH}, automation=${AUTOMATION_BRANCH}"
+
       - name: Resolve Service Tags URL
         id: source
         env:
@@ -64,8 +73,10 @@ jobs:
           fi
 
           base_url="https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63"
+          download_url="${base_url}/ServiceTags_Public_${source_date}.json"
           echo "source_date=$source_date" >> "$GITHUB_OUTPUT"
-          echo "download_url=${base_url}/ServiceTags_Public_${source_date}.json" >> "$GITHUB_OUTPUT"
+          echo "download_url=$download_url" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Service Tags source::date=${source_date}, url=${download_url}"
 
       - name: Download Service Tags
         id: download
@@ -74,6 +85,17 @@ jobs:
           --download-url "${{ steps.source.outputs.download_url }}"
           --download-dir "${{ runner.temp }}/service-tags"
           --github-output "$GITHUB_OUTPUT"
+
+      - name: Log download result
+        env:
+          AVAILABLE: ${{ steps.download.outputs.available }}
+          DOWNLOAD_PATH: ${{ steps.download.outputs.download_path }}
+        run: |
+          if [[ "$AVAILABLE" == "true" ]]; then
+            echo "::notice title=Download complete::Service Tags saved to ${DOWNLOAD_PATH}"
+          else
+            echo "::notice title=No publication::The requested Service Tags file is not available; downstream jobs will be skipped"
+          fi
 
       - name: Set artifact name
         if: steps.download.outputs.available == 'true'
@@ -109,6 +131,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Log processing context
+        env:
+          ARTIFACT_NAME: ${{ needs.download.outputs.artifact-name }}
+        run: |
+          echo "::notice title=Processing context::artifact=${ARTIFACT_NAME}, target=${TARGET_BRANCH}, automation=${AUTOMATION_BRANCH}"
+
       - name: Download Service Tags artifact
         uses: actions/download-artifact@v5
         with:
@@ -126,6 +154,7 @@ jobs:
             exit 1
           fi
           echo "path=${source_files[0]}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Source located::${source_files[0]}"
 
       - name: Use snapshot from an open automation PR
         env:
@@ -143,6 +172,7 @@ jobs:
               --json number \
               --jq 'length'
           )"
+          echo "::notice title=PR lookup::found=${open_prs}, head=${AUTOMATION_BRANCH}, base=${TARGET_BRANCH}"
           if [[ "$open_prs" -gt 1 ]]; then
             echo "Expected at most one open automation PR; found $open_prs" >&2
             exit 1
@@ -151,6 +181,9 @@ jobs:
             git fetch --no-tags origin "$AUTOMATION_BRANCH"
             git show FETCH_HEAD:data/powerbi-canadacentral-prefixes.json > snapshot.tmp
             mv snapshot.tmp data/powerbi-canadacentral-prefixes.json
+            echo "::notice title=Baseline selected::Using the snapshot from ${AUTOMATION_BRANCH}"
+          else
+            echo "::notice title=Baseline selected::Using the snapshot from ${TARGET_BRANCH}"
           fi
 
       - name: Build IP allow-list actions
@@ -163,6 +196,26 @@ jobs:
           --actions ip-manage-actions.json
           --summary "${{ runner.temp }}/ip-change-summary.md"
           --github-output "$GITHUB_OUTPUT"
+
+      - name: Log processing result
+        env:
+          ADDED_COUNT: ${{ steps.process.outputs.added_count }}
+          CHANGED: ${{ steps.process.outputs.changed }}
+          REMOVED_COUNT: ${{ steps.process.outputs.removed_count }}
+          SUMMARY_PATH: ${{ steps.process.outputs.summary_path }}
+        run: |
+          echo "::notice title=Allow-list comparison::changed=${CHANGED}, added=${ADDED_COUNT}, removed=${REMOVED_COUNT}"
+          {
+            echo "## IP allow-list update"
+            echo
+            echo "| Target branch | Changed | Added | Removed |"
+            echo "| --- | --- | ---: | ---: |"
+            echo "| \`${TARGET_BRANCH}\` | ${CHANGED} | ${ADDED_COUNT} | ${REMOVED_COUNT} |"
+            if [[ -f "$SUMMARY_PATH" ]]; then
+              echo
+              cat "$SUMMARY_PATH"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create or update pull request
         if: steps.process.outputs.changed == 'true'
@@ -183,6 +236,19 @@ jobs:
             data/powerbi-canadacentral-prefixes.json
             ip-manage-actions.json
 
+      - name: Log pull request result
+        if: steps.process.outputs.changed == 'true'
+        env:
+          PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
+          PR_OPERATION: ${{ steps.pull-request.outputs.pull-request-operation }}
+          PR_URL: ${{ steps.pull-request.outputs.pull-request-url }}
+        run: |
+          if [[ -n "$PR_NUMBER" ]]; then
+            echo "::notice title=Pull request ${PR_OPERATION}::number=${PR_NUMBER}, url=${PR_URL}"
+          else
+            echo "::notice title=Pull request unchanged::The automation branch has no additional commit to propose"
+          fi
+
       - name: Comment with IP address changes
         if: >-
           steps.process.outputs.changed == 'true' &&
@@ -191,7 +257,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
           SUMMARY_PATH: ${{ steps.process.outputs.summary_path }}
-        run: gh pr comment "$PR_NUMBER" --body-file "$SUMMARY_PATH"
+        run: |
+          echo "::notice title=PR comment::Posting the CIDR summary to PR #${PR_NUMBER}"
+          gh pr comment "$PR_NUMBER" --body-file "$SUMMARY_PATH"
 
       - name: Upload IP management actions
         if: >-
@@ -226,6 +294,10 @@ jobs:
           path: ${{ runner.temp }}/ip-manage-actions
 
       - name: Create SNOW Entry
-        run: >-
-          python scripts/ip_allow_list.py create-snow-entry
-          --actions "${{ runner.temp }}/ip-manage-actions/ip-manage-actions.json"
+        env:
+          ACTIONS_PATH: ${{ runner.temp }}/ip-manage-actions/ip-manage-actions.json
+          PR_NUMBER: ${{ needs.process.outputs.pull-request-number }}
+        run: |
+          echo "::notice title=SNOW request::Creating an entry from PR #${PR_NUMBER} using ${ACTIONS_PATH}"
+          python scripts/ip_allow_list.py create-snow-entry --actions "$ACTIONS_PATH"
+          echo "::notice title=SNOW result::Mock entry created successfully"
